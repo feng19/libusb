@@ -19,7 +19,7 @@ defmodule LibUSB.MixProject do
 
   defp deps do
     [
-      {:rustler, "~> 0.26"}
+      {:rustler, "~> 0.30"}
     ]
   end
 end
