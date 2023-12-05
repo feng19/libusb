@@ -1,7 +1,6 @@
-use std::io::Write;
+use rusb::{ConfigDescriptor, Context, DeviceHandle, Direction, TransferType, UsbContext};
+use rustler::{Atom, Binary, Env, Error, NifResult, NifStruct, ResourceArc, Term};
 use std::collections::HashMap;
-use rustler::{Atom, Binary, Env, Error, NewBinary, NifResult, NifStruct, ResourceArc, Term};
-use rusb::{UsbContext, ConfigDescriptor, Context, DeviceHandle, TransferType, Direction};
 
 mod atoms {
     rustler::atoms! {
@@ -16,11 +15,13 @@ mod atoms {
     }
 }
 
-struct DeviceResource {
+pub struct DeviceResource {
     pub device_handle: DeviceHandle<Context>,
     pub in_endpoint: u8,
     pub out_endpoint: u8,
 }
+
+pub type Resource = ResourceArc<DeviceResource>;
 
 fn load(env: Env, _: Term) -> bool {
     rustler::resource!(DeviceResource, env);
@@ -60,7 +61,10 @@ fn info(env: Env) -> HashMap<Term, bool> {
     info.insert(atoms::has_capability().to_term(env), rusb::has_capability());
     info.insert(atoms::has_hid_access().to_term(env), rusb::has_hid_access());
     info.insert(atoms::has_hotplug().to_term(env), rusb::has_hotplug());
-    info.insert(atoms::supports_detach_kernel_driver().to_term(env), rusb::supports_detach_kernel_driver());
+    info.insert(
+        atoms::supports_detach_kernel_driver().to_term(env),
+        rusb::supports_detach_kernel_driver(),
+    );
     info
 }
 
@@ -77,8 +81,16 @@ fn list_devices() -> Vec<Device> {
             product_id: device_desc.product_id(),
             class_code: device_desc.class_code(),
             sub_class_code: device_desc.sub_class_code(),
-            usb_version: (usb_version.major(), usb_version.minor(), usb_version.sub_minor()),
-            device_version: (device_version.major(), device_version.minor(), device_version.sub_minor()),
+            usb_version: (
+                usb_version.major(),
+                usb_version.minor(),
+                usb_version.sub_minor(),
+            ),
+            device_version: (
+                device_version.major(),
+                device_version.minor(),
+                device_version.sub_minor(),
+            ),
             protocol_code: device_desc.protocol_code(),
             max_packet_size: device_desc.max_packet_size(),
             manufacturer_index: device_desc.manufacturer_string_index().unwrap_or(0),
@@ -100,44 +112,73 @@ fn list_devices() -> Vec<Device> {
 }
 
 #[rustler::nif]
-fn open(vendor_id: u16, product_id: u16) -> NifResult<(Atom, ResourceArc<DeviceResource>)> {
-    let context = to_term_error(Context::new())?;
+fn write(
+    vendor_id: u16,
+    product_id: u16,
+    binary: Binary,
+    timeout: u64,
+) -> Result<(Atom, usize), rustler::Error> {
+    match Context::new() {
+        Ok(mut context) => match open_device(&mut context, vendor_id, product_id) {
+            Some((device, _device_desc, mut device_handle)) => {
+                let config_descriptor = to_term_error(device.active_config_descriptor())?;
+                let (_in_endpoint, out_endpoint) = detected_endpoint(config_descriptor)?;
 
-    let devices = to_term_error(context.devices())?;
-    for device in devices.iter() {
-        let s = to_term_error(device.device_descriptor())?;
-        if s.vendor_id() == vendor_id && s.product_id() == product_id {
-            // Before opening the device, we must find the bulk endpoint
-            let config_descriptor = to_term_error(device.active_config_descriptor())?;
-            let (in_endpoint, out_endpoint) = detected_endpoint(config_descriptor)?;
-
-            // Now we continue opening the device
-            match device.open() {
-                Ok(mut device_handle) => {
-                    if let Ok(active) = device_handle.kernel_driver_active(0) {
-                        if active {
-                            // The kernel is active, we have to detach it
-                            match device_handle.detach_kernel_driver(0) {
-                                Ok(_) => (),
-                                Err(e) => return Err(Error::Term(Box::new(e.to_string())))
-                            };
-                        }
-                    };
-                    // Now we claim the interface
-                    match device_handle.claim_interface(0) {
-                        Ok(_) => (),
-                        Err(e) => return Err(Error::Term(Box::new(e.to_string())))
+                if let Ok(active) = device_handle.kernel_driver_active(0) {
+                    if active {
+                        // The kernel is active, we have to detach it
+                        match device_handle.detach_kernel_driver(0) {
+                            Ok(_) => (),
+                            Err(e) => return Err(Error::Term(Box::new(e.to_string()))),
+                        };
                     }
-                    let resource = ResourceArc::new(DeviceResource { device_handle, in_endpoint, out_endpoint });
-                    return Ok((atoms::ok(), resource));
+                };
+                // Now we claim the interface
+                match device_handle.claim_interface(0) {
+                    Ok(_) => (),
+                    Err(e) => return Err(Error::Term(Box::new(e.to_string()))),
                 }
-                Err(e) => return Err(Error::Term(Box::new(e.to_string())))
-            };
+
+                match device_handle.write_bulk(
+                    out_endpoint,
+                    binary.as_slice(),
+                    std::time::Duration::from_secs(timeout),
+                ) {
+                    Ok(s) => Ok((atoms::ok(), s)),
+                    Err(e) => Err(Error::Term(Box::new(e.to_string()))),
+                }
+            }
+            None => Err(Error::Term(Box::new(atoms::not_found()))),
+        },
+        Err(e) => Err(Error::Term(Box::new(e.to_string()))),
+    }
+}
+
+fn open_device<T: UsbContext>(
+    context: &mut T,
+    vid: u16,
+    pid: u16,
+) -> Option<(rusb::Device<T>, rusb::DeviceDescriptor, DeviceHandle<T>)> {
+    let devices = match context.devices() {
+        Ok(d) => d,
+        Err(_) => return None,
+    };
+
+    for device in devices.iter() {
+        let device_desc = match device.device_descriptor() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        if device_desc.vendor_id() == vid && device_desc.product_id() == pid {
+            match device.open() {
+                Ok(handle) => return Some((device, device_desc, handle)),
+                Err(e) => panic!("Device found but failed to open: {}", e),
+            }
         }
     }
-    // Not found with such vid and pid
-    let reason = atoms::not_found();
-    Err(Error::Term(Box::new(reason)))
+
+    None
 }
 
 fn detected_endpoint(config_descriptor: ConfigDescriptor) -> NifResult<(u8, u8)> {
@@ -148,8 +189,8 @@ fn detected_endpoint(config_descriptor: ConfigDescriptor) -> NifResult<(u8, u8)>
         for descriptor in interface.descriptors() {
             for endpoint in descriptor.endpoint_descriptors() {
                 match (endpoint.transfer_type(), endpoint.direction()) {
-                    (TransferType::Bulk, Direction::Out) => { out_endpoint = Some(endpoint.number()) }
-                    (TransferType::Bulk, Direction::In) => { in_endpoint = Some(endpoint.number()) }
+                    (TransferType::Bulk, Direction::Out) => out_endpoint = Some(endpoint.number()),
+                    (TransferType::Bulk, Direction::In) => in_endpoint = Some(endpoint.number()),
                     _ => {}
                 }
             }
@@ -161,7 +202,7 @@ fn detected_endpoint(config_descriptor: ConfigDescriptor) -> NifResult<(u8, u8)>
             let reason = atoms::no_bulk_endpoint();
             Err(Error::Term(Box::new(reason)))
         }
-        _ => { Ok((in_endpoint.unwrap(), out_endpoint.unwrap())) }
+        _ => Ok((in_endpoint.unwrap(), out_endpoint.unwrap())),
     }
 }
 
@@ -169,31 +210,8 @@ fn to_term_error<T>(res: Result<T, impl ToString>) -> NifResult<T> {
     res.map_err(|e| Error::Term(Box::new(e.to_string())))
 }
 
-#[rustler::nif]
-fn write_bulk(resource: ResourceArc<DeviceResource>, binary: Binary, timeout: u64) -> NifResult<usize> {
-    to_term_error(resource.device_handle.write_bulk(
-        resource.out_endpoint,
-        binary.as_slice(),
-        std::time::Duration::from_secs(timeout),
-    ))
-}
-
-#[rustler::nif]
-fn read_bulk(env: Env, resource: ResourceArc<DeviceResource>, timeout: u64) -> NifResult<Binary> {
-    let mut buff = vec![0u8];
-
-    let length: usize = match resource.device_handle.read_bulk(
-        resource.in_endpoint,
-        &mut buff,
-        std::time::Duration::from_secs(timeout),
-    ) {
-        Ok(len) => { len }
-        Err(e) => return Err(Error::Term(Box::new(e.to_string())))
-    };
-
-    let mut binary = NewBinary::new(env, length);
-    binary.as_mut_slice().write_all(&buff).unwrap();
-    Ok(binary.into())
-}
-
-rustler::init!("Elixir.LibUSB.Native", [info, list_devices, open, write_bulk, read_bulk], load = load);
+rustler::init!(
+    "Elixir.LibUSB.Native",
+    [info, list_devices, write],
+    load = load
+);
